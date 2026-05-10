@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+  <title>Industrial Gateway Dashboard</title>
+  <script src='https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js'></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Arial, sans-serif; background: #0f1117; color: #e0e0e0; }
+    header { background: #1a1d27; padding: 16px 24px; display: flex;
+             align-items: center; justify-content: space-between;
+             border-bottom: 2px solid #2E75B6; }
+    header h1 { font-size: 1.2rem; color: #7eb8f7; }
+    #status-bar { display: flex; gap: 24px; font-size: 0.85rem; color: #aaa; }
+    #conn-dot { width: 10px; height: 10px; border-radius: 50%;
+                background: #4caf50; display: inline-block; margin-right: 6px; }
+    .charts-grid { display: grid; grid-template-columns: 1fr 1fr;
+                   gap: 16px; padding: 16px; }
+    .chart-card { background: #1a1d27; border-radius: 8px; padding: 16px;
+                  border: 1px solid #2a2d3a; }
+    .chart-card h3 { font-size: 0.9rem; color: #7eb8f7; margin-bottom: 12px; }
+    canvas { max-height: 200px; }
+    #anomaly-panel { margin: 0 16px 16px; background: #1a1d27;
+                     border-radius: 8px; padding: 16px;
+                     border: 1px solid #2a2d3a; }
+    #anomaly-panel h3 { color: #7eb8f7; margin-bottom: 12px; font-size: 0.9rem; }
+    .anomaly-item { display: flex; align-items: flex-start; gap: 12px;
+                    padding: 8px 0; border-bottom: 1px solid #2a2d3a; }
+    .anomaly-item:last-child { border-bottom: none; }
+    .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem;
+             font-weight: bold; white-space: nowrap; }
+    .badge.HIGH   { background: #c0392b; color: #fff; }
+    .badge.MEDIUM { background: #e67e22; color: #fff; }
+    .anomaly-reason { font-size: 0.85rem; color: #ccc; }
+    .anomaly-time   { font-size: 0.75rem; color: #777; }
+    #no-anomalies { color: #555; font-size: 0.85rem; }
+    @media (max-width: 600px) { .charts-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>&#9881; Industrial Gateway Dashboard</h1>
+  <div id='status-bar'>
+    <span><span id='conn-dot'></span><span id='conn-label'>Connecting...</span></span>
+    <span>Uptime: <b id='uptime'>--</b></span>
+    <span>CPU: <b id='cpu-total'>--%</b></span>
+    <span>RAM: <b id='ram-pct'>--%</b></span>
+    <span>Clients: <b id='ws-clients'>0</b></span>
+  </div>
+</header>
+
+<div class='charts-grid'>
+  <div class='chart-card'>
+    <h3>Temperature (Modbus) &deg;C</h3>
+    <canvas id='chart-temp'></canvas>
+  </div>
+  <div class='chart-card'>
+    <h3>Machine speed (RPM-CAN bus)</h3>
+    <canvas id='chart-rpm'></canvas>
+  </div>
+  <div class='chart-card'>
+    <h3>Vibration Frequency (Hz)</h3>
+    <canvas id='chart-fft'></canvas>
+  </div>
+  <div class='chart-card'>
+    <h3>CPU usage per Core (%)</h3>
+    <canvas id='chart-cpu'></canvas>
+  </div>
+</div>
+
+<div id='anomaly-panel'>
+  <h3>&#9888; Anomaly Alerts</h3>
+  <div id='anomaly-list'><p id='no-anomalies'>No issues detected.</p></div>
+</div>
+
+<script>
+  const RULE_LABELS = {
+    'freq_deviation': 'Unusual vibration',
+    'temp_high':      'High temperature',
+    'rpm_high':       'Speed too high',
+    'can_warning':    'Machine warning',
+    'can_fault':      'Machine fault',
+  };
+
+  function friendlyReason(anomaly) {
+    const r = anomaly.reason || '';
+    if (anomaly.rule === 'freq_deviation') {
+      const pct = anomaly.data?.deviation_pct;
+      return pct
+        ? `Vibration shifted ${pct.toFixed(0)}% away from normal`
+        : 'Vibration pattern changed unexpectedly';
+    }
+    if (anomaly.rule === 'temp_high') {
+      const t = anomaly.data?.temperature;
+      return t ? `Temperature reached ${t.toFixed(1)} °C (limit: 40 °C)` : r;
+    }
+    if (anomaly.rule === 'rpm_high') {
+      const rpm = anomaly.data?.rpm;
+      return rpm ? `Speed reached ${rpm} RPM (limit: 3,500 RPM)` : r;
+    }
+    if (anomaly.rule === 'can_warning') {
+      const rpm = anomaly.data?.rpm;
+      return rpm ? `Machine speed reached ${rpm} RPM — approaching maximum limit` : 'Machine speed is high';
+    }
+    if (anomaly.rule === 'can_fault')   return 'Machine is reporting a fault — check hardware';
+    return r;
+  }
+  //Chart factory 
+  const MAX_POINTS = 60;   // Keep last 60 data points on each chart
+
+  function makeChart(id, label, color, yLabel) {
+    const ctx = document.getElementById(id).getContext('2d');
+    return new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{ label, data: [], borderColor: color,
+          backgroundColor: color + '22', fill: true,
+          borderWidth: 2, pointRadius: 0, tension: 0.3 }]
+      },
+      options: {
+        animation: false,
+        responsive: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#666', maxTicksLimit: 6 },
+               grid: { color: '#2a2d3a' } },
+          y: { ticks: { color: '#aaa' }, grid: { color: '#2a2d3a' },
+               title: { display: !!yLabel, text: yLabel, color: '#777' } }
+        }
+      }
+    });
+  }
+
+  const charts = {
+    temp: makeChart('chart-temp', 'Temperature',      '#e74c3c', '°C'),
+    rpm:  makeChart('chart-rpm',  'Speed',            '#3498db', 'RPM'),
+    fft:  makeChart('chart-fft',  'Vibration',        '#2ecc71', 'Hz'),
+    cpu:  makeChart('chart-cpu',  'CPU load',         '#f39c12', '%'),
+  };
+
+  function pushPoint(chart, label, value) {
+    chart.data.labels.push(label);
+    chart.data.datasets[0].data.push(value);
+    if (chart.data.labels.length > MAX_POINTS) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+    }
+    chart.update('none');   
+  }
+
+  function timeLabel(ts) {
+    return new Date(ts * 1000).toLocaleTimeString();
+  }
+
+  //Load history on page open 
+  async function loadHistory() {
+    try {
+      const res  = await fetch('/api/history?minutes=2');
+      const data = await res.json();
+      data.modbus.forEach(d => {
+        pushPoint(charts.temp, timeLabel(d.t), d.temperature);
+      });
+      data.can.forEach(d => {
+        pushPoint(charts.rpm,  timeLabel(d.t), d.rpm);
+      });
+      data.fft.forEach(d => {
+        pushPoint(charts.fft,  timeLabel(d.t), d.dominant_freq);
+      });
+      loadAnomalies();
+    } catch(e) { console.warn('History load failed:', e); }
+  }
+
+  async function loadAnomalies() {
+    try {
+      const res  = await fetch('/api/anomalies?limit=10');
+      const data = await res.json();
+      renderAnomalies(data);
+    } catch(e) {}
+  }
+
+
+const expandedRules = new Set();
+
+function toggleExpand(rule) {
+  const id = 'expand-' + rule.replace(/_/g, '-');
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (expandedRules.has(rule)) {
+    expandedRules.delete(rule);
+    el.style.display = 'none';
+  } else {
+    expandedRules.add(rule);
+    el.style.display = 'block';
+  }
+}
+
+function renderAnomalies(list) {
+  const el = document.getElementById('anomaly-list');
+  if (!list.length) {
+    el.innerHTML = '<p id="no-anomalies">No issues detected.</p>';
+    return;
+  }
+
+  const groups = {};
+  list.forEach(a => {
+    if (!groups[a.rule]) groups[a.rule] = [];
+    groups[a.rule].push(a);
+  });
+
+  el.innerHTML = Object.entries(groups).map(([rule, items]) => {
+    const latest = items[0];
+    const count  = items.length;
+    const id     = 'expand-' + rule.replace(/_/g, '-');
+    const isOpen = expandedRules.has(rule);
+
+    const historyRows = items.map(a =>
+      `<div style="font-size:12px; color:var(--color-text-secondary); padding:4px 0; border-bottom:0.5px solid var(--color-border-tertiary);">
+        ${a.time_str} — ${friendlyReason(a)}
+      </div>`
+    ).join('');
+
+    return `
+      <div class='anomaly-item' style="flex-direction:column; align-items:stretch;">
+        <div style="display:flex; align-items:center; gap:12px; cursor:pointer;"
+             onclick="toggleExpand('${rule}')">
+          <span class='badge ${latest.severity}'>
+            ${latest.severity === 'HIGH' ? 'Critical' : 'Warning'}
+          </span>
+          <div style="flex:1;">
+            <div class='anomaly-reason'>${friendlyReason(latest)}</div>
+            <div class='anomaly-time'>
+              Last seen ${latest.time_str} — ${RULE_LABELS[rule] || rule}
+              ${count > 1
+                ? `<span style="color:var(--color-text-secondary);"> · ${count}x — tap to ${isOpen ? 'collapse' : 'expand'}</span>`
+                : ''}
+            </div>
+          </div>
+        </div>
+        <div id="${id}"
+             style="display:${isOpen ? 'block' : 'none'};
+                    margin-top:8px; padding:8px;
+                    background:var(--color-background-secondary);
+                    border-radius:var(--border-radius-md);">
+          ${historyRows}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+  //Status bar refresh
+  async function refreshStatus() {
+    try {
+      const s = await fetch('/api/status').then(r => r.json());
+      document.getElementById('uptime').textContent     = s.uptime_human;
+      document.getElementById('cpu-total').textContent  = s.cpu_total.toFixed(1) + '%';
+      document.getElementById('ram-pct').textContent    = s.memory_pct.toFixed(1) + '%';
+      document.getElementById('ws-clients').textContent = s.ws_clients;
+      // Push CPU average as a data point on the CPU chart
+      pushPoint(charts.cpu, timeLabel(Date.now()/1000), s.cpu_total);
+    } catch(e) {}
+  }
+  setInterval(refreshStatus, 2000);
+  setInterval(loadAnomalies, 2000);
+
+  //WebSocket
+  let ws, reconnectTimer;
+  const dot   = document.getElementById('conn-dot');
+  const label = document.getElementById('conn-label');
+
+  function connect() {
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${protocol}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      dot.style.background   = '#4caf50';
+      label.textContent      = 'Live';
+      clearTimeout(reconnectTimer);
+    };
+
+    ws.onclose = () => {
+      dot.style.background = '#e74c3c';
+      label.textContent    = 'Reconnecting in 3s...';
+      reconnectTimer = setTimeout(connect, 3000);
+    };
+
+    ws.onmessage = (event) => {
+      let d;
+      try { d = JSON.parse(event.data); } catch { return; }
+      const t = timeLabel(d.timestamp || Date.now()/1000);
+
+      if (d.source === 'modbus') {
+        pushPoint(charts.temp, t, d.temperature);
+      }
+      if (d.source === 'can') {
+        pushPoint(charts.rpm, t, d.rpm);
+      }
+      if (d.source === 'fft') {
+        pushPoint(charts.fft, t, d.dominant_freq);
+      }
+      if (d.source === 'anomaly') {
+        loadAnomalies();   // Refresh anomaly list from REST API
+        // Flash the anomaly panel border red
+        const panel = document.getElementById('anomaly-panel');
+        panel.style.borderColor = '#e74c3c';
+        setTimeout(() => { panel.style.borderColor = '#2a2d3a'; }, 2000);
+      }
+    };
+  }
+  
+  loadHistory();
+  connect();
+</script>
+
+</body>
+</html>
